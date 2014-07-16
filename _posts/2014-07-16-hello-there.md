@@ -12,5 +12,5 @@ that'll lead.
 
 Stay tuned for more, soon.
 
-In the meantime, head to the right-side menu for a few direct links to a number
-of public social profiles.
+In the meantime, head to the left-side menu for a few direct links to my public
+social profiles.
