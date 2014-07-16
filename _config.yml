@@ -1,0 +1,10 @@
+name: ey3ball.github.io
+tagline: ey3ball.github.io
+title: ey3ball
+url: ey3ball.github.io
+baseurl: ""
+description: "" 
+
+# Build settings
+markdown: redcarpet
+permalink: pretty
