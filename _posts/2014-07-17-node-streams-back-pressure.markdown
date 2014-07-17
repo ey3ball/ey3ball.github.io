@@ -1,8 +1,8 @@
 ---
 layout: post
 title:  "Understanding node streams, back-pressure ... the hard way"
-date:   2014-07-17 01:00:00 +0200
-categories: nodejs
+date:   2014-07-17 23:00:00 +0200
+categories: posts
 ---
 
 # Context
@@ -459,4 +459,16 @@ source.pipe(new Leaky()).pipe(destination);
 
 And that's it : Leaky will act as a lossy buffer between a fast source, and a
 slow destination.
+
+# Conclusion
+
+When going through Node's documentation, *back-pressure* is a bit of a magic
+word that is used to explain how pull-based streaming works. How it is actually
+achieved is a bit of a mystery. Is it an internal algorithm that's somehow
+triggered in stream objects, does it come from the API design, both ? Its
+actual inner workings, although simple, are not described.
+
+I hope this article will help, through a simple example, shed some light on
+this mechanism : where it is showing up in the APIs, what its consequences are
+for developers and how to control its behaviour when needed.
 
