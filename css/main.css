@@ -302,3 +302,8 @@ h1 {
   font-size: 0.95em;
   color: #777;
 }
+
+.social {
+  float:left;
+  margin-top: 1.5em;
+}
