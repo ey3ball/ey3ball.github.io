@@ -15,31 +15,30 @@ I'll explain its purpose in more details). Node seemed particularly well suited
 for this :
 
   * It natively speaks http
-  * Its data handling APIs are focused on a concept of stream, making it easy
-    to "connect" a data source (the iptv stream) and a sink (the client
-    application, your video player).
+  * Its data handling APIs build upon the concept of streams, making it easy to
+    "connect" a data source (an iptv stream) and a sink (a client application,
+    typically your video player).
 
-I quickly found out however, that my requirements were a bit exotic : given
-that I'm proxying **live** streams, I'm not interested in *reliability*.
-Actually it's the exact opposite : I needed my proxy to send data out as fast
-as possible, potentially to multiple clients. If some of these clients are
-requesting the same stream and one of them is too slow to keep up with the data
-rate, it should experience packet loss. This way fast clients always read a
-correct stream, while slow clients will see choppy playback and / or dropped
-audio/video frames (but this will enable them to keep to stay "in sync" with
-the source).
+I quickly found out however, that some of my requirements were a bit exotic :
+given that the focus is on **live** streams, *reliability* of the transport is
+of little interest.  Actually it's the exact opposite : the proxy needs to send
+data out as fast as possible, potentially to multiple clients. If some of these
+clients are requesting the same stream and one of them is too slow to keep up
+with the data rate, it **must** experience *packet loss*. This way fast clients
+always read a correct stream, while slow clients will see choppy playback and /
+or dropped audio/video frames (but this will enable them to keep to stay *in
+sync* with the source).
 
 The issue is, the philosophy around NodeJS streams is the exact opposite : they
-are **pull** based. They apply
-[back-pressure](http://howtonode.org/streams-explained) on the source. This
-basically means that if you attempt to
+are **pull** based. This basically means that if you attempt to
 [pipe](http://nodejs.org/api/stream.html#stream_readable_pipe_destination_options)
-some source data into multiple destinations, it will only flow as fast as the
-slowest client can handle. Worse even, since NodeJS streams implement an
-internal back-pressure algorithm, this will go up the chain and the slowest
-client will impose its read rate on the source, which means you don't even get
-a chance to drop packets by implementing a lossy "pipe" in-between (spoiler:
-that's unless you understand node's internals correctly).
+some data into multiple destinations, it will only flow as fast as the slowest
+client can handle. Worse even, since NodeJS streams implement
+[back-pressure](http://howtonode.org/streams-explained), this will go up the
+chain and the slowest client will impose its read rate on the source, which
+means you don't even get a chance to drop packets by implementing a lossy
+"pipe" in-between (spoiler: that's unless you understand node's internals
+correctly).
 
 It took me a little while to wrap my head around how these mechanisms are
 managed by NodeJS (and how to bypass them for my particular use case). This
@@ -47,10 +46,10 @@ article attempts to document various findings I've made along the way.
 
 # Streams 101
 
-NodeJS basically builds upon two types of stream :
+NodeJS basically builds upon two elementary types of stream :
 
-  * Writable streams (streams you can send data to)
-  * Readable streams (streams you can read data from)
+  * **Writable streams** (streams you can *send data to*)
+  * **Readable streams** (streams you can *read data from*)
 
 A stream that's writable only is basically a sink, while a stream that's
 readable only is a source.
@@ -58,13 +57,14 @@ readable only is a source.
 Anything in-between must be a Duplex stream (both Readable and Writable). A
 Transform stream is a special kind of Duplex stream, where the output is
 computed directly from the source. A PassThrough stream is a Duplex/Transform
-stream that does nothing but let data flow, untouched.
+stream that does nothing but let data flow, untouched. (see
+[here](http://nodejs.org/api/stream.html) for the full picture)
 
-NodeJS provides a native way to build chains of streams linking a source to
+NodeJS provides a native way to build chains of streams linking a source to its
 sink thanks to the `pipe` method. This makes building data processing pipeline
 easy.
 
-Here is a basic example usage of using and connecting streams :
+Here is a basic example of using and connecting streams :
 
 ```javascript
 /* process.stdin is a Readable stream
@@ -78,15 +78,15 @@ process.stdin.pipe(process.stdout);
 /* We could insert a duplex stream in-between,
  * for instance to implement "grep"
  */
-process.stdin.pipe(new FilterStream_Grep("hello")).pipe(process.stdout)
+process.stdin.pipe(new FilterStream_Grep(".*hello.*")).pipe(process.stdout)
 
 ```
 
 Back to our use case, how do you proxy one source http stream to several
-clients in NodeJS that's as simple as :
+clients ? With NodeJS that's as simple as :
 
 ```javascript
-source = http.request("http://....", function(http_source_stream) {
+request = http.request("http://....", function(http_source_stream) {
         http_source_stream.pipe(http_client1_output);
         http_source_stream.pipe(http_client2_output);
 });
@@ -94,21 +94,26 @@ source = http.request("http://....", function(http_source_stream) {
 
 # A simple, leaky stream attempt
 
-Back to our lossy pipe problem.
+Back to our unreliable streaming problem.
 
-What was so hard ? When I ran into the issue my first though was : Ok, let's
-write a dummy "leaky" stream. It will let data flow, like a PassThrough stream,
-unless the destination's internal buffer becomes full. Should that happen our
-stream will simply drop chunks until the destination becomes available again.
+What was so hard ?
+
+As previously discussed, the issue is that NodeJS streams are *reliable* by
+default. How do *break* this reliability and start losing chunks along the way ?
+
+My first though was : Ok, let's write a dummy "leaky" stream. It will let data
+flow, just like a PassThrough stream, but that's unless its destination refuses
+to take more data in. Should that happen our stream will simply drop chunks
+until the sink becomes available again.
 
 Simple enough right ?
 
-Here is what it looks like after a dozen of minutes hacking around (in terrible
-inline creation style as I was just trying to figure out this stuff as I wrote
-it) :
+Here is what it looked like after a fair amount of time hacking around (in
+terrible inline object creation style as I was just trying to figure out this
+stuff as I wrote it) :
 
 ```javascript
-/* out leaky stream is a transform stream, output is exactly the input, unless
+/* our leaky stream is a transform stream, output is exactly the input, unless
  * we need to drop some chunks */
 var leaky = new require('stream').Transform();
 
@@ -121,34 +126,41 @@ var leaky = new require('stream').Transform();
  * if the buffer is full enq will overwrite the oldest
  * element in the ring
  */
-leaky.rb = new ringbuffer(20);
+leaky.rb = new ringbuffer(10);
 
+/* keep track of the sink's current status */
 leaky.target_ready = true;
 
 /* implement a leaky passthrough using a transform stream that lossily
- * stores chunks in a ringbuffer
+ * stores chunks in a ringbuffer by implementing a _transform method.
  *
  * see: http://nodejs.org/api/stream.html#stream_class_stream_transform 
  */
 leaky._transform = function(chunk, encoding, done) {
-        /* Push data to ringbuffer, eventually overwritten some other sample */
+        /* Push data to ringbuffer, eventually overwritten some older
+         * queued samples */
         this.rb.enq(chunk);
 
         if (this.target_ready) {
-                /* if the destination is ready to receive, grab chunk from buffer */
+                /* if the destination is ready to receive,
+                 * grab a chunk from buffer ... */
                 var send = this.rb.deq();
 
-                /* push data out
+                /* ... and push that data out
+                 *
                  * note: this.pipes contains an handle to a piped (.pipe())
                  * destination stream */
                 if (!this.push(send.data) && this.pipes) {
-                        /* push returns false: we're getting back-pressured */
-
+                        /* push returns false:
+                         * the destination is getting overwelmed
+                         * (we're back-pressured) */
                         console.log('full');
+
+                        /* update sink status: not ready anymore */
                         this.target_ready = false;
 
-                        /* catch the drain event which tells us the destination is
-                         * ready to receive again */
+                        /* catch the drain event which tells us when the
+                         * destination is ready to receive again */
                         this.pipes.once('drain', this.got_drain.bind(this));
                 }
         }
@@ -156,7 +168,10 @@ leaky._transform = function(chunk, encoding, done) {
         done();
 }
 
-/* resume sending data to the destination */
+/* handle drain event :
+ * resume sending data to the destination after
+ * flushing any pending data we had hanging
+ */
 leaky.got_drain = function() {
         var go = true;
         console.log('drain');
@@ -169,37 +184,40 @@ leaky.got_drain = function() {
                 /* we're stuck again ! */
                 this.pipes.once('drain', this.got_drain.bind(this));
         } else {
+                /* we don't have anything left to send, resume regular
+                 * operation */
                 this.target_ready = true;
         }
 }
 
-/* insert our leaky passthrough attempt in-between the source and
- * our destination */
+/* insert our leaky passthrough stream attempt in-between
+ * the source and our destination */
 source.pipe(leaky).pipe(destination);
 ```
 
 So basically we have created a transform stream. It pushes data chunks in a
-circular buffer. As long as the piped destination is not overwelmed, it also
+circular buffer. As long as the piped destination is not overwhelmed, it also
 immediately pulls a data chunk out of that buffer and pushes it downstream.
 When the destination signals it can't handle more data, we let the circular
 buffer get filled and potentially overflowed. We only resume sending new chunks
-once the destination stream sends us a 'drain' (= ready to go) event.
+once the destination stream sends us a 'drain' (= starving, send me more)
+event.
 
-Notice the two logs I have inserted here. One would print 'full' as soon as the
-destination signals a buffer overrun and 'drain' as soon as the destination is
-back to a nicer buffering level.
+*Notice the two logs* that have been inserted here. One would print 'full' as
+soon as the destination signals a buffer overrun and the other 'drain' as soon
+as the destination is back to a nicer buffering level.
 
-To my surprise, when running the code above with a slow client, these two logs
-are never displayed.
+To my surprise, when running the code above with a slow client, **these two
+logs are never displayed.**
 
 # Show me that back-pressure
 
 Initially I though that push() returning false was node's way of propagating
 back-pressure. After all, if you look at the (evasive) documentation on the
 [subject](http://nodejs.org/api/stream.html#stream_event_drain) back-pressure
-is mentionned once in an example that shows how to interact with Writable
-streams correctly. It therefore semmed only natural that using the internal
-push() call when connecting to streams at a lower level would have the same
+is mentioned once in an example using `write` that shows how to interact with
+Writable streams correctly. It therefore seemed only natural that using the
+internal push() call when connecting two streams natively would have the same
 semantics, especially since according to the
 [doc](http://nodejs.org/api/stream.html#stream_readable_read_size_1) :
 
@@ -210,25 +228,24 @@ semantics, especially since according to the
 Which sounds a lot like back-pressure handling to me !
 
 Therefore my initial conclusion was that back-pressure is actually handled at a
-lower level, and that I can't bypass it in a custom stream unless I start
+lower level, and it can't be bypassed by a custom stream unless we start
 messing with its deep internals.
 
 # Working around back-pressure : fake fast drain
 
 Since the dummy transform stream approach failed, I turned to a second
 solution. This time I'd write a fake destination stream, that can receive data
-at full speed by listening to data events. Then I'd manually handle the
-transport to the real destination by calling the higher level "write" method,
-which is used by non-streamy clients in order to to push data to anything
-streamy.
+at full speed by implementing a sink. Then I'd manually handle the transport to
+the real destination by calling the higher level `write` method, which is used
+by non-*streamy* clients in order to to push data to anything *streamy*.
 
 The advantage of this second method is that since the destination and the
 source are not linked through a sequence of pipes, nodejs can't back-pressure
-my source stream against my will.
+the source stream against our will.
 
-What does it look like ? Here is my leaky stream proxy. It does essentially the
-same thing that my leaky transform stream (hence I did not heavily comment it),
-only one API level above. 
+What does it look like ? Here is a leaky stream relay. It does essentially the
+same thing than our previous transform stream (hence I did not heavily comment
+it), only one API level above. 
 
 ```javascript
 Ringbuffer = new require('ringbufferjs');
@@ -238,8 +255,8 @@ util = require('util');
 
 util.inherits(Leaky, Writable);
 
-/* The destination stream is given as the first argument when
- * instanciating this "leaky" stream proxy
+/* The destination stream must be provided (first argument) when
+ * instanciating this "leaky" stream relay
  *
  * instead of using 
  *   $ source.pipe(leaky).pipe(destination);
@@ -271,8 +288,8 @@ Leaky.prototype._write = function(chunk, encoding, done) {
                 /* Use the external API of Writable streams to push data :
                  * the effect is the same as a pipe (we move data around),
                  * except here the destination thinks we're not a "streamy"
-                 * client since streams are not connected through this
-                 * usual mecanism */
+                 * client considering streams are not connected through the
+                 * pipe mecanism */
                 if (!this._target_stream.write(chunk)) {
                         this._target_ready = false;
                         this._target_stream.once('drain', this._got_drain.bind(this));
@@ -301,14 +318,15 @@ module.exports = Leaky;
 
 Does this work ?
 
-Yes, finally ! As I suspected back-pressure doesn't hurt us anymore : the
-source stream can be read at full speed and with this proxy inserted, a fast
-client won't get stalled by a second slow destination. As expected these now
+Yes, finally ! As suspected back-pressure doesn't hurt us anymore : the source
+stream can be read at full speed and with this relay inserted, a fast client
+won't get stalled by a second slow destination. As expected these *stallers*
 experience garbled video, lost frames, macroblocks ... you name it.
 
 # Streams : deep dive
 
-Now that we're starting to grasp what's happening here, time to get our hands dirty.
+Now that we're starting to get a grasp of what's happening, time to get our
+hands dirty.
 
 NodeJS streams are defined here :
 
@@ -341,10 +359,10 @@ been able to infer :
 // cause the system to run out of memory.
 ```
 
-Indeed going back to our initial observations regarding the semantics of
-`push()`, it seems that it is definitely involved in handling back-pressure,
-however, what we can understand here, is that push only ever returns false if a
-transform stream writes **more data** that what it has *been fed with*.
+Going back to our initial observations regarding the semantics of `push()`, it
+seems it is indeed involved in propagating back-pressure.  However, what we get
+to understand here, is that push only ever returns false if a transform stream
+writes **more data** that what it has *been fed with*.
 
 In our leaky transform scenario, this mechanism never gets trigerred since we
 write at most the same amount of data we're provided with. As a consequence
@@ -386,14 +404,15 @@ no `_transform` involved.
 # Pimp my pipe
 
 In the end, can we get an object that would get us the same behaviour than our
-successful leaky attempt, but at the same time be a native stream ?
+successful leaky relay attempt, but at the same time be a native stream ?
 
 Definitely !
 
 Having seen some stream internals we understand that the solution is to use a
 Duplex stream in place of a Transform stream. Indeed a duplex stream lets us
-write custom `_read` and `_write` routines. Following our latest observations
-this gives us full control over how and when back-pressure is applied.
+write directly custom `_read` and `_write` routines. Following our latest
+observations this gives us full control over how and when back-pressure is
+applied.
 
 ```javascript
 Ringbuffer = new require('ringbufferjs');
@@ -440,3 +459,4 @@ source.pipe(new Leaky()).pipe(destination);
 
 And that's it : Leaky will act as a lossy buffer between a fast source, and a
 slow destination.
+
